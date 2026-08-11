@@ -27,7 +27,7 @@ processing. The protocol has no client operation ID or deduplication table.
 | --- | --- | --- |
 | One follower stops | Available through the leader and remaining follower | A majority still exists; acknowledged writes remain durable on two members. |
 | Leader stops | Temporarily unavailable | A follower normally wins an election after the randomized timeout. Clients must discover it and reconnect. |
-| One node is isolated from the other two | Available only on the two-node side after/while it has a leader | The isolated node cannot confirm reads or commit writes. An isolated old leader steps down when it later observes a higher term. |
+| One node is isolated from the other two | Available only on the two-node side after/while it has a leader | The isolated node cannot confirm reads or commit writes. An isolated old leader steps down after it loses recent quorum contact, or immediately when it observes a higher term. |
 | No two healthy members can communicate | Unavailable | No new quorum-confirmed read or committed mutation can complete. Local health/status commands may still answer. |
 | Client connection drops during a mutation | Outcome is unknown | The entry may have committed even though the response was lost, or may remain uncommitted and later be replaced. |
 | Process crashes after replying `OK` | Available after failover if two members remain | The acknowledged entry already existed durably on a majority. |

@@ -35,16 +35,22 @@ marshalled back to the owning Raft executor before they touch consensus state.
    responses in request order, even if the underlying futures finish in a
    different order.
 
-Backpressure has three layers:
+Backpressure has five layers:
 
 - The fixed command executor has a bounded queue.
+- Each Raft node admits at most 8,192 client operations across its connections
+  and at most 8,192 uncommitted mutation entries while it is leader.
 - At 512 pending responses on a connection, automatic reads pause; they resume
   at 256.
 - Netty's outbound write-buffer watermarks pause reads while the channel is not
   writable (64 KiB high, 32 KiB low by default).
+- The group-commit worker has a bounded 8,192-request admission queue. If it is
+  full, a leader rejects the new mutation with `TRYAGAIN` before publishing a
+  log entry; saturation is not treated as a disk failure.
 
-These bounds prevent an arbitrarily fast producer from creating an unbounded
-number of command objects or pending responses.
+Together these controls bound admitted data operations and pending responses on
+each connection. Open connections remain an operator-level resource limit and
+are not globally capped by the server.
 
 ## Mutation path
 
@@ -103,10 +109,13 @@ At startup, the WAL is scanned from the beginning:
   truncated to the last valid boundary;
 - corruption before the final frame is fatal and requires operator action.
 
-Term, vote, and commit metadata are persisted separately. The state machine is
-in memory and is reconstructed by replaying committed log entries. There is no
-snapshot or prefix compaction yet, so the complete retained log remains part of
-restart cost.
+Term, vote, and commit metadata are persisted separately through an atomic
+replacement; both the temporary file and its containing directory are forced
+before the transition is accepted. A node fails closed if its filesystem cannot
+provide those primitives. Recovery also rejects metadata whose term is behind
+the last retained log term. The state machine is in memory and is reconstructed
+by replaying committed log entries. There is no snapshot or prefix compaction
+yet, so the complete retained log remains part of restart cost.
 
 ## Network layout
 

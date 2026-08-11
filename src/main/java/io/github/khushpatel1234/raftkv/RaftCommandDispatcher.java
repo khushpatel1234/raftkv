@@ -48,6 +48,7 @@ final class RaftCommandDispatcher implements CommandDispatcher {
                 last_applied:%d
                 last_log_index:%d
                 cluster_size:%d
+                healthy:%s
                 """.formatted(
                 status.nodeId(),
                 status.role().name().toLowerCase(java.util.Locale.ROOT),
@@ -56,7 +57,8 @@ final class RaftCommandDispatcher implements CommandDispatcher {
                 status.commitIndex(),
                 status.lastApplied(),
                 status.lastLogIndex(),
-                status.clusterSize());
+                status.clusterSize(),
+                status.healthy() ? "yes" : "no");
         return RespResponse.bulk(body);
     }
 

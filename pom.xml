@@ -18,13 +18,12 @@
     <logback.version>1.5.16</logback.version>
     <junit.version>5.11.4</junit.version>
     <awaitility.version>4.3.0</awaitility.version>
-    <hdrhistogram.version>2.2.2</hdrhistogram.version>
   </properties>
 
   <dependencies>
     <dependency>
       <groupId>io.netty</groupId>
-      <artifactId>netty-all</artifactId>
+      <artifactId>netty-handler</artifactId>
       <version>${netty.version}</version>
     </dependency>
     <dependency>
@@ -38,12 +37,6 @@
       <version>${logback.version}</version>
       <scope>runtime</scope>
     </dependency>
-    <dependency>
-      <groupId>org.hdrhistogram</groupId>
-      <artifactId>HdrHistogram</artifactId>
-      <version>${hdrhistogram.version}</version>
-    </dependency>
-
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter</artifactId>

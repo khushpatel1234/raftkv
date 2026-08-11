@@ -38,18 +38,29 @@ public final class Main {
 
         Files.createDirectories(options.dataDirectory());
         var raftConfiguration = RaftConfiguration.defaults(options.nodeId(), options.members());
+        var metadata = new RaftMetadataStore(options.dataDirectory().resolve("raft.meta"));
+        var log = new GroupCommitLog(
+                options.dataDirectory().resolve("raft.wal"),
+                options.groupCommitBatch(),
+                options.groupCommitDelay());
         var transport = new NettyRaftTransport(
                 options.nodeId(),
                 new InetSocketAddress(options.raftHost(), options.raftPort()),
                 options.members(),
                 raftConfiguration.rpcTimeout());
-        var log = new GroupCommitLog(
-                options.dataDirectory().resolve("raft.wal"),
-                options.groupCommitBatch(),
-                options.groupCommitDelay());
-        var metadata = new RaftMetadataStore(options.dataDirectory().resolve("raft.meta"));
-        var node = new RaftNode(
-                raftConfiguration, transport, log, metadata, new KeyValueStateMachine());
+        final RaftNode node;
+        try {
+            node = new RaftNode(
+                    raftConfiguration, transport, log, metadata, new KeyValueStateMachine());
+        } catch (Throwable recoveryFailure) {
+            transport.close();
+            try {
+                log.close();
+            } catch (Exception closeFailure) {
+                recoveryFailure.addSuppressed(closeFailure);
+            }
+            throw recoveryFailure;
+        }
 
         var defaults = ServerConfig.defaults(options.clientHost(), options.clientPort());
         var serverConfig = new ServerConfig(

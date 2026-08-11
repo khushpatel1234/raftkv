@@ -31,15 +31,17 @@ request in flight per connection. For each successful measured operation it
 records end-to-end round-trip latency. The output is RFC-compatible CSV with:
 
 ```text
-timestamp_utc,run_label,git_commit,operation,host,port,clients,pipeline,
-duration_s,keyspace,value_bytes,successes,errors,ops_per_sec,p50_ms,p95_ms,p99_ms
+timestamp_utc,run_label,git_commit,operation,host,port,clients,pipeline,duration_s,keyspace,value_bytes,successes,errors,ops_per_sec,p50_ms,p95_ms,p99_ms
 ```
 
 Percentiles use the nearest-rank method across successful requests. Throughput
 is successful operations divided by the actual measurement interval. Server
-errors, protocol errors, and connection failures are counted separately; a run
-with errors exits non-zero. For `GET`, the driver first writes every key with a
-fixed-size value. Preload and warmup operations are not included in the row.
+errors, protocol errors, and connection failures contribute to one aggregate
+`errors` field and are printed to standard error; each affected worker stops at
+its first error, and a run with errors exits non-zero. For `GET`, the driver
+first writes every key with a fixed-size value. `SET` workers cycle through one
+shared configured keyspace. Preload and warmup operations are not included in
+the row.
 
 The driver validates every response. This catches accidentally targeting a
 follower, missing preloaded data, and malformed protocol results instead of
@@ -73,7 +75,8 @@ The wrapper runs `GET` and then quorum-durable `SET` with these defaults:
 
 It writes a new timestamped file under `bench/results/` and refuses to overwrite
 an existing file. The commit SHA is captured when the directory is a Git
-checkout. All controls can be explicit for an archived run:
+checkout; the wrapper adds a `dirty` suffix when tracked or untracked changes
+are present. All controls can be explicit for an archived run:
 
 ```bash
 RAFTKV_BENCH_HOST=127.0.0.1 \
@@ -105,7 +108,8 @@ directories, on the same machine. The default batched configuration is:
 
 ```bash
 java -jar target/raftkv.jar \
-  --node-id=1 --client-port=6379 --raft-port=7000 \
+  --node-id=1 --client-host=127.0.0.1 --client-port=6379 \
+  --raft-host=127.0.0.1 --raft-port=7000 \
   --peers=1=127.0.0.1:7000 --data-dir=data/bench-batched \
   --group-commit-batch=64 --group-commit-delay-ms=2
 ```
@@ -114,7 +118,8 @@ The no-batching comparison is:
 
 ```bash
 java -jar target/raftkv.jar \
-  --node-id=1 --client-port=6379 --raft-port=7000 \
+  --node-id=1 --client-host=127.0.0.1 --client-port=6379 \
+  --raft-host=127.0.0.1 --raft-port=7000 \
   --peers=1=127.0.0.1:7000 --data-dir=data/bench-unbatched \
   --group-commit-batch=1 --group-commit-delay-ms=0
 ```

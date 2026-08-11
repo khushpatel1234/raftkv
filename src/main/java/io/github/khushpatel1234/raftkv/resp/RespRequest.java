@@ -1,5 +1,6 @@
 package io.github.khushpatel1234.raftkv.resp;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 
@@ -7,10 +8,20 @@ import java.util.Objects;
 public record RespRequest(List<byte[]> arguments) {
     public RespRequest {
         Objects.requireNonNull(arguments, "arguments");
-        arguments = List.copyOf(arguments);
+        var copy = new ArrayList<byte[]>(arguments.size());
         for (byte[] argument : arguments) {
-            Objects.requireNonNull(argument, "argument");
+            copy.add(Objects.requireNonNull(argument, "argument").clone());
         }
+        arguments = List.copyOf(copy);
+    }
+
+    @Override
+    public List<byte[]> arguments() {
+        var copy = new ArrayList<byte[]>(arguments.size());
+        for (byte[] argument : arguments) {
+            copy.add(argument.clone());
+        }
+        return List.copyOf(copy);
     }
 
     public int size() {
@@ -18,6 +29,6 @@ public record RespRequest(List<byte[]> arguments) {
     }
 
     public byte[] argument(int index) {
-        return arguments.get(index);
+        return arguments.get(index).clone();
     }
 }

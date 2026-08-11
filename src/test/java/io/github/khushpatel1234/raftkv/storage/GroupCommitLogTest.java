@@ -16,6 +16,8 @@ import java.util.stream.LongStream;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTimeout;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class GroupCommitLogTest {
@@ -78,9 +80,45 @@ class GroupCommitLogTest {
     void appendAfterCloseFails() throws IOException {
         GroupCommitLog log = new GroupCommitLog(tempDirectory.resolve("closed.wal"));
         log.close();
-        CompletableFuture<Void> rejected = log.append(entry(1));
+        var submission = log.submitAppend(entry(1));
+        assertEquals(GroupCommitLog.SubmissionStatus.UNAVAILABLE, submission.status());
+        CompletableFuture<Void> rejected = submission.durability();
         assertTrue(rejected.isCompletedExceptionally());
         assertFalse(rejected.isCancelled());
+    }
+
+    @Test
+    void closeReturnsAfterTheWriterHasAlreadyFailed() throws IOException {
+        var wal = new WriteAheadLog(tempDirectory.resolve("failed.wal"));
+        var log = new GroupCommitLog(wal, 8, Duration.ZERO, 8);
+        wal.close();
+
+        assertThrows(CompletionException.class, () -> log.append(entry(1)).join());
+        assertTimeoutPreemptively(Duration.ofSeconds(1),
+                () -> assertThrows(IOException.class, log::close));
+    }
+
+    @Test
+    void interruptedCloseCompletesTheSharedCloseFuture() throws IOException {
+        var log = new GroupCommitLog(tempDirectory.resolve("interrupted-close.wal"));
+
+        Thread.currentThread().interrupt();
+        try {
+            assertTimeout(Duration.ofSeconds(1),
+                    () -> assertThrows(IOException.class, log::close));
+        } finally {
+            // close() restores the flag; never leak it into later JUnit tests.
+            Thread.interrupted();
+        }
+        assertFalse(Thread.currentThread().isInterrupted());
+
+        assertTimeoutPreemptively(Duration.ofSeconds(1), () -> {
+            try {
+                log.close();
+            } catch (IOException expected) {
+                // An interrupted first close completes the shared future exceptionally.
+            }
+        });
     }
 
     private static List<RaftLogEntry> entries(long first, int count) {

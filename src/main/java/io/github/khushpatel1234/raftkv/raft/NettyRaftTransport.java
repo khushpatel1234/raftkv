@@ -10,6 +10,7 @@ import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
+import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.nio.NioEventLoopGroup;
@@ -20,6 +21,7 @@ import io.netty.handler.codec.ByteToMessageCodec;
 import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
 import io.netty.handler.codec.LengthFieldPrepender;
 import io.netty.handler.timeout.IdleStateHandler;
+import io.netty.handler.timeout.IdleStateEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -44,7 +46,7 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public final class NettyRaftTransport implements RaftTransport {
     private static final Logger LOGGER = LoggerFactory.getLogger(NettyRaftTransport.class);
-    private static final int MAX_FRAME_BYTES = 16 * 1024 * 1024;
+    private static final int MAX_FRAME_BYTES = 64 * 1024 * 1024;
 
     private final int localNodeId;
     private final InetSocketAddress bindAddress;
@@ -130,6 +132,20 @@ public final class NettyRaftTransport implements RaftTransport {
                 raw.completeExceptionally(connectError);
                 return;
             }
+            if (raw.isDone()) {
+                peer.invalidate(channel);
+                return;
+            }
+            raw.whenComplete((ignored, error) -> {
+                if (error != null) {
+                    peer.invalidate(channel);
+                }
+            });
+            if (!channel.isActive() || !channel.isWritable()) {
+                raw.completeExceptionally(
+                        new IllegalStateException("Raft peer channel is not writable"));
+                return;
+            }
             channel.writeAndFlush(request).addListener(write -> {
                 if (!write.isSuccess()) {
                     raw.completeExceptionally(write.cause());
@@ -205,24 +221,38 @@ public final class NettyRaftTransport implements RaftTransport {
             this.address = address;
         }
 
-        CompletableFuture<Channel> channel() {
-            while (true) {
-                var existing = current.get();
-                if (existing != null) {
-                    return existing.thenCompose(channel -> channel.isActive()
-                            ? CompletableFuture.completedFuture(channel)
-                            : reconnect(existing));
+        synchronized CompletableFuture<Channel> channel() {
+            if (closed) {
+                return CompletableFuture.failedFuture(
+                        new IllegalStateException("transport is closed"));
+            }
+            var existing = current.get();
+            if (existing != null) {
+                if (!existing.isDone()) {
+                    return existing;
                 }
-                var connecting = connect();
-                if (current.compareAndSet(null, connecting)) {
-                    return connecting;
+                Channel channel;
+                try {
+                    channel = existing.getNow(null);
+                } catch (java.util.concurrent.CompletionException failedConnection) {
+                    channel = null;
+                }
+                if (channel != null && channel.isActive()) {
+                    return existing;
+                }
+                current.compareAndSet(existing, null);
+                if (channel != null) {
+                    channel.close();
                 }
             }
-        }
-
-        private CompletableFuture<Channel> reconnect(CompletableFuture<Channel> observed) {
-            current.compareAndSet(observed, null);
-            return channel();
+            var connecting = connect();
+            current.set(connecting);
+            connecting.whenComplete((channel, error) -> {
+                if (error != null) {
+                    current.compareAndSet(connecting, null);
+                }
+            });
+            return connecting;
         }
 
         private CompletableFuture<Channel> connect() {
@@ -237,7 +267,6 @@ public final class NettyRaftTransport implements RaftTransport {
                 if (future.isSuccess()) {
                     result.complete(future.channel());
                 } else {
-                    current.compareAndSet(result, null);
                     result.completeExceptionally(future.cause());
                 }
             });
@@ -246,13 +275,21 @@ public final class NettyRaftTransport implements RaftTransport {
 
         void invalidate(Channel channel) {
             var existing = current.get();
-            if (existing != null && existing.getNow(null) == channel) {
-                current.compareAndSet(existing, null);
+            if (existing != null) {
+                Channel active = null;
+                try {
+                    active = existing.getNow(null);
+                } catch (java.util.concurrent.CompletionException failedConnection) {
+                    // A later failed connection must not prevent this old channel from closing.
+                }
+                if (active == channel) {
+                    current.compareAndSet(existing, null);
+                }
             }
             channel.close();
         }
 
-        void close() {
+        synchronized void close() {
             var existing = current.getAndSet(null);
             if (existing != null) {
                 existing.thenAccept(Channel::close);
@@ -265,6 +302,17 @@ public final class NettyRaftTransport implements RaftTransport {
         protected void initChannel(SocketChannel channel) {
             channel.pipeline()
                     .addLast(new IdleStateHandler(0, 0, 60))
+                    .addLast(new ChannelInboundHandlerAdapter() {
+                        @Override
+                        public void userEventTriggered(ChannelHandlerContext context, Object event)
+                                throws Exception {
+                            if (event instanceof IdleStateEvent) {
+                                context.close();
+                            } else {
+                                super.userEventTriggered(context, event);
+                            }
+                        }
+                    })
                     .addLast(new LengthFieldBasedFrameDecoder(MAX_FRAME_BYTES, 0, 4, 0, 4))
                     .addLast(new LengthFieldPrepender(4))
                     .addLast(new WireCodec())
@@ -272,6 +320,12 @@ public final class NettyRaftTransport implements RaftTransport {
                         @Override
                         protected void channelRead0(ChannelHandlerContext context, WireMessage message) {
                             receive(message, context.channel());
+                        }
+
+                        @Override
+                        public void exceptionCaught(ChannelHandlerContext context, Throwable cause) {
+                            LOGGER.warn("Closing Raft channel after a protocol or transport error", cause);
+                            context.close();
                         }
                     });
         }

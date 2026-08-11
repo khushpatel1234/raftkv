@@ -76,6 +76,17 @@ class RespResponseEncoderTest {
         assertThrows(IllegalArgumentException.class, () -> RespResponse.error("ERR bad\nline"));
     }
 
+    @Test
+    void bulkResponsesDefensivelyCopyTheirBytes() {
+        byte[] source = bytes("safe");
+        RespResponse.BulkString response = (RespResponse.BulkString) RespResponse.bulk(source);
+        source[0] = 'X';
+        byte[] exposed = response.value();
+        exposed[1] = 'X';
+
+        assertArrayEquals(bytes("safe"), response.value());
+    }
+
     private static String readAscii(EmbeddedChannel channel) {
         ByteBuf encoded = channel.readOutbound();
         try {
@@ -83,5 +94,9 @@ class RespResponseEncoderTest {
         } finally {
             encoded.release();
         }
+    }
+
+    private static byte[] bytes(String value) {
+        return value.getBytes(StandardCharsets.US_ASCII);
     }
 }

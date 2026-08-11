@@ -33,6 +33,7 @@ jobs:
         run: |
           bash -n scripts/cluster.sh scripts/smoke.sh bench/run.sh
           python3 -m py_compile bench/resp_bench.py
+          docker compose config --quiet
 
       - name: Build and test
         run: mvn --batch-mode --no-transfer-progress verify

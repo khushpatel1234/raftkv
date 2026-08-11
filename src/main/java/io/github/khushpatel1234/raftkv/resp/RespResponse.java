@@ -53,6 +53,14 @@ public sealed interface RespResponse permits RespResponse.SimpleString, RespResp
 
     /** A {@code null} value represents the RESP2 null bulk string. */
     record BulkString(byte[] value) implements RespResponse {
+        public BulkString {
+            value = value == null ? null : value.clone();
+        }
+
+        @Override
+        public byte[] value() {
+            return value == null ? null : value.clone();
+        }
     }
 
     record ArrayValue(List<RespResponse> values) implements RespResponse {

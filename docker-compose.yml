@@ -6,7 +6,7 @@ x-raftkv-common: &raftkv-common
     context: .
   init: true
   restart: unless-stopped
-  stop_grace_period: 10s
+  stop_grace_period: 90s
   networks:
     - raftkv
 
@@ -21,7 +21,7 @@ services:
       - --data-dir=/data
       - --peers=1=raftkv-1:7000,2=raftkv-2:7000,3=raftkv-3:7000
     ports:
-      - "${RAFTKV_NODE1_CLIENT_PORT:-6379}:6379"
+      - "127.0.0.1:${RAFTKV_NODE1_CLIENT_PORT:-6379}:6379"
     volumes:
       - raftkv-1-data:/data
 
@@ -35,7 +35,7 @@ services:
       - --data-dir=/data
       - --peers=1=raftkv-1:7000,2=raftkv-2:7000,3=raftkv-3:7000
     ports:
-      - "${RAFTKV_NODE2_CLIENT_PORT:-6380}:6379"
+      - "127.0.0.1:${RAFTKV_NODE2_CLIENT_PORT:-6380}:6379"
     volumes:
       - raftkv-2-data:/data
 
@@ -49,7 +49,7 @@ services:
       - --data-dir=/data
       - --peers=1=raftkv-1:7000,2=raftkv-2:7000,3=raftkv-3:7000
     ports:
-      - "${RAFTKV_NODE3_CLIENT_PORT:-6381}:6379"
+      - "127.0.0.1:${RAFTKV_NODE3_CLIENT_PORT:-6381}:6379"
     volumes:
       - raftkv-3-data:/data
 

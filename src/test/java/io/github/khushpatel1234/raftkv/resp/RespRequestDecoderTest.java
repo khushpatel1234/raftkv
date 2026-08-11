@@ -153,6 +153,22 @@ class RespRequestDecoderTest {
         }
     }
 
+    @Test
+    void decodedRequestsDoNotExposeMutableArgumentStorage() {
+        EmbeddedChannel channel = new EmbeddedChannel(new RespRequestDecoder());
+        try {
+            assertTrue(channel.writeInbound(buffer("*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n")));
+            RespRequest request = channel.readInbound();
+            byte[] argument = request.argument(1);
+            argument[0] = 'X';
+            request.arguments().get(1)[1] = 'X';
+
+            assertArrayEquals(bytes("key"), request.argument(1));
+        } finally {
+            channel.finishAndReleaseAll();
+        }
+    }
+
     private static ByteBuf buffer(String value) {
         return Unpooled.copiedBuffer(value, StandardCharsets.US_ASCII);
     }

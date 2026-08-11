@@ -21,8 +21,11 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -37,6 +40,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class RaftNode implements RaftRpcHandler, AutoCloseable {
     private static final Logger LOGGER = LoggerFactory.getLogger(RaftNode.class);
     private static final int MAX_APPEND_BATCH = 64;
+    private static final int MAX_APPEND_BYTES = 48 * 1024 * 1024;
+    private static final int MAX_UNCOMMITTED_ENTRIES = 8_192;
+    private static final int MAX_CLIENT_IN_FLIGHT = 8_192;
 
     private final RaftConfiguration configuration;
     private final RaftTransport transport;
@@ -47,11 +53,15 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
     private final List<RaftLogEntry> log = new ArrayList<>();
     private final Map<Integer, Long> nextIndex = new HashMap<>();
     private final Map<Integer, Long> matchIndex = new HashMap<>();
-    private final Set<Integer> replicationInFlight = new HashSet<>();
+    private final Map<Integer, Long> lastContactNanos = new HashMap<>();
+    private final Map<Integer, Long> replicationInFlight = new HashMap<>();
     private final Map<Long, PendingProposal> proposals = new HashMap<>();
+    private final List<PendingRead> readsAwaitingCurrentTermCommit = new ArrayList<>();
     private final Set<Long> durabilityCompletions = new HashSet<>();
     private final AtomicBoolean started = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final Semaphore clientAdmission = new Semaphore(MAX_CLIENT_IN_FLIGHT);
+    private final Set<CompletableFuture<?>> pendingOperations = ConcurrentHashMap.newKeySet();
 
     private RaftRole role = RaftRole.FOLLOWER;
     private long currentTerm;
@@ -60,7 +70,10 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
     private long commitIndex;
     private long lastApplied;
     private long durableIndex;
+    private boolean followerMutationInFlight;
     private boolean healthy = true;
+    private long leadershipStartedNanos;
+    private long replicationSequence;
     private ScheduledFuture<?> electionTimer;
     private ScheduledFuture<?> heartbeatTimer;
     private volatile RaftStatus status;
@@ -88,6 +101,11 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
         validateRecoveredLog();
         durableIndex = lastLogIndex();
         var metadata = metadataStore.load();
+        long recoveredLastTerm = termAt(durableIndex);
+        if (metadata.term() < recoveredLastTerm) {
+            throw new IOException("persisted term " + metadata.term()
+                    + " is behind recovered log term " + recoveredLastTerm);
+        }
         currentTerm = metadata.term();
         votedFor = parseVote(metadata.votedFor());
         if (metadata.commitIndex() > durableIndex) {
@@ -104,7 +122,9 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
             throw new IllegalStateException("node is already started");
         }
         transport.start(this);
-        execute(this::resetElectionTimer);
+        if (!execute(this::resetElectionTimer)) {
+            throw new IllegalStateException("node was closed during startup");
+        }
     }
 
     public CompletableFuture<Void> set(byte[] key, byte[] value) {
@@ -120,8 +140,18 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
         Objects.requireNonNull(key, "key");
         var keyCopy = key.clone();
         var result = new CompletableFuture<byte[]>();
+        if (!admitClientOperation(result)) {
+            return result;
+        }
         long deadline = System.nanoTime() + configuration.proposalTimeout().toNanos();
-        execute(() -> attemptRead(keyCopy, result, deadline));
+        submit(() -> attemptRead(keyCopy, result, deadline), result);
+        result.orTimeout(configuration.proposalTimeout().toMillis(), TimeUnit.MILLISECONDS);
+        result.whenComplete((ignored, error) -> {
+            if (error != null) {
+                execute(() -> readsAwaitingCurrentTermCommit.removeIf(
+                        read -> read.future() == result));
+            }
+        });
         return result;
     }
 
@@ -136,9 +166,28 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
     private CompletableFuture<Long> propose(RaftCommand command) {
         Objects.requireNonNull(command, "command");
         var result = new CompletableFuture<Long>();
-        execute(() -> appendAsLeader(command, result));
+        if (!admitClientOperation(result)) {
+            return result;
+        }
+        submit(() -> appendAsLeader(command, result), result);
         result.orTimeout(configuration.proposalTimeout().toMillis(), TimeUnit.MILLISECONDS);
+        result.whenComplete((ignored, error) -> {
+            if (error != null) {
+                execute(() -> proposals.entrySet().removeIf(
+                        entry -> entry.getValue().future() == result));
+            }
+        });
         return result;
+    }
+
+    private boolean admitClientOperation(CompletableFuture<?> result) {
+        if (!clientAdmission.tryAcquire()) {
+            result.completeExceptionally(
+                    new QuorumUnavailableException("too many client operations in flight"));
+            return false;
+        }
+        result.whenComplete((ignored, error) -> clientAdmission.release());
+        return true;
     }
 
     private void appendAsLeader(RaftCommand command, CompletableFuture<Long> clientFuture) {
@@ -154,13 +203,33 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
             }
             return;
         }
+        if (clientFuture != null && lastLogIndex() - commitIndex >= MAX_UNCOMMITTED_ENTRIES) {
+            clientFuture.completeExceptionally(
+                    new QuorumUnavailableException("too many uncommitted entries"));
+            return;
+        }
+        int commandBytes = command.encode().length;
+        if (commandBytes + Long.BYTES * 2 + Integer.BYTES > MAX_APPEND_BYTES) {
+            if (clientFuture != null) {
+                clientFuture.completeExceptionally(
+                        new IllegalArgumentException("command is too large to replicate"));
+            } else {
+                storageFailed(new IllegalArgumentException("internal command is too large to replicate"));
+            }
+            return;
+        }
         var entry = new RaftLogEntry(lastLogIndex() + 1, currentTerm, command);
+        var submission = durableLog.submitAppend(entry);
+        if (!submission.accepted()) {
+            handleRejectedAppend(command, clientFuture, submission);
+            return;
+        }
         log.add(entry);
         if (clientFuture != null) {
             proposals.put(entry.index(), new PendingProposal(clientFuture));
         }
         refreshStatus();
-        durableLog.append(entry).whenComplete((ignored, error) -> execute(() -> {
+        submission.durability().whenComplete((ignored, error) -> execute(() -> {
             if (error != null) {
                 storageFailed(error);
                 return;
@@ -170,6 +239,33 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
             matchIndex.put(configuration.nodeId(), durableIndex);
             advanceCommitIndex();
             replicateAll();
+        }));
+    }
+
+    private void handleRejectedAppend(
+            RaftCommand command,
+            CompletableFuture<Long> clientFuture,
+            GroupCommitLog.Submission submission) {
+        if (submission.status() == GroupCommitLog.SubmissionStatus.OVERLOADED) {
+            if (clientFuture != null) {
+                clientFuture.completeExceptionally(
+                        new QuorumUnavailableException("WAL admission queue is full"));
+            } else if (command.type() == RaftCommand.Type.NOOP) {
+                executor.schedule(
+                        () -> appendAsLeader(command, null),
+                        configuration.heartbeatInterval().toMillis(),
+                        TimeUnit.MILLISECONDS);
+            }
+            return;
+        }
+        submission.durability().whenComplete((ignored, error) -> execute(() -> {
+            var failure = error == null
+                    ? new IllegalStateException("WAL is unavailable")
+                    : unwrap(error);
+            storageFailed(failure);
+            if (clientFuture != null) {
+                clientFuture.completeExceptionally(failure);
+            }
         }));
     }
 
@@ -196,7 +292,7 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
             return;
         }
         if (commitIndex == 0 || termAt(commitIndex) != currentTerm) {
-            executor.schedule(() -> attemptRead(key, result, deadlineNanos), 5, TimeUnit.MILLISECONDS);
+            readsAwaitingCurrentTermCommit.add(new PendingRead(key, result, deadlineNanos));
             return;
         }
         if (configuration.majority() == 1) {
@@ -209,7 +305,7 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
         var decided = new boolean[] {false};
         for (int peer : configuration.peers().keySet()) {
             var heartbeat = new RaftRpc.AppendEntriesRequest(readTerm, configuration.nodeId(),
-                    0, 0, List.of(), commitIndex);
+                    0, 0, List.of(), 0);
             transport.appendEntries(peer, heartbeat).whenComplete((response, error) -> execute(() -> {
                 if (result.isDone() || decided[0] || role != RaftRole.LEADER || currentTerm != readTerm) {
                     return;
@@ -239,7 +335,7 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
     public CompletableFuture<RaftRpc.RequestVoteResponse> requestVote(
             RaftRpc.RequestVoteRequest request) {
         var result = new CompletableFuture<RaftRpc.RequestVoteResponse>();
-        execute(() -> handleRequestVote(request, result));
+        submit(() -> handleRequestVote(request, result), result);
         return result;
     }
 
@@ -256,6 +352,14 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
         }
         if (request.term() > currentTerm) {
             becomeFollower(request.term(), null);
+            if (!healthy) {
+                result.completeExceptionally(new IllegalStateException("could not persist the new term"));
+                return;
+            }
+        }
+        if (followerMutationInFlight) {
+            result.complete(new RaftRpc.RequestVoteResponse(currentTerm, false));
+            return;
         }
         boolean upToDate = request.lastLogTerm() > termAt(durableIndex)
                 || (request.lastLogTerm() == termAt(durableIndex)
@@ -264,7 +368,10 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
         boolean granted = upToDate && canVote;
         if (granted) {
             votedFor = request.candidateId();
-            persistMetadata();
+            if (!persistMetadata()) {
+                result.complete(new RaftRpc.RequestVoteResponse(currentTerm, false));
+                return;
+            }
             resetElectionTimer();
         }
         refreshStatus();
@@ -275,7 +382,7 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
     public CompletableFuture<RaftRpc.AppendEntriesResponse> appendEntries(
             RaftRpc.AppendEntriesRequest request) {
         var result = new CompletableFuture<RaftRpc.AppendEntriesResponse>();
-        execute(() -> handleAppendEntries(request, result));
+        submit(() -> handleAppendEntries(request, result), result);
         return result;
     }
 
@@ -293,9 +400,19 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
         }
         if (request.term() > currentTerm || role != RaftRole.FOLLOWER) {
             becomeFollower(request.term(), request.leaderId());
+            if (!healthy) {
+                result.completeExceptionally(new IllegalStateException("could not persist the new term"));
+                return;
+            }
         }
         leaderId = request.leaderId();
         resetElectionTimer();
+
+        if (followerMutationInFlight) {
+            result.complete(new RaftRpc.AppendEntriesResponse(
+                    currentTerm, false, durableIndex, durableIndex + 1));
+            return;
+        }
 
         if (request.prevLogIndex() > durableIndex) {
             result.complete(new RaftRpc.AppendEntriesResponse(
@@ -322,7 +439,24 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
                     return;
                 }
                 int appendFrom = firstNew;
-                durableLog.truncateSuffix(incoming.index()).whenComplete((ignored, error) ->
+                var truncation = durableLog.submitTruncateSuffix(incoming.index());
+                if (!truncation.accepted()) {
+                    if (truncation.status() == GroupCommitLog.SubmissionStatus.OVERLOADED) {
+                        result.completeExceptionally(
+                                new QuorumUnavailableException("WAL admission queue is full"));
+                    } else {
+                        truncation.durability().whenComplete((ignored, error) -> execute(() -> {
+                            var failure = error == null
+                                    ? new IllegalStateException("WAL is unavailable")
+                                    : unwrap(error);
+                            storageFailed(failure);
+                            result.completeExceptionally(failure);
+                        }));
+                    }
+                    return;
+                }
+                beginFollowerMutation();
+                truncation.durability().whenComplete((ignored, error) ->
                         execute(() -> {
                             if (error != null) {
                                 storageFailed(error);
@@ -330,6 +464,12 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
                                 return;
                             }
                             truncateInMemory(incoming.index());
+                            finishFollowerMutation();
+                            if (!isCurrentLeaderRequest(request)) {
+                                result.complete(new RaftRpc.AppendEntriesResponse(
+                                        currentTerm, false, durableIndex, durableIndex + 1));
+                                return;
+                            }
                             appendFollowerEntries(request, appendFrom, result);
                         }));
                 return;
@@ -346,8 +486,8 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
             CompletableFuture<RaftRpc.AppendEntriesResponse> result) {
         var additions = request.entries().subList(firstNew, request.entries().size());
         if (additions.isEmpty()) {
-            advanceFollowerCommit(request.leaderCommit());
             long match = request.prevLogIndex() + request.entries().size();
+            advanceFollowerCommit(Math.min(request.leaderCommit(), match));
             result.complete(new RaftRpc.AppendEntriesResponse(currentTerm, true, match, match + 1));
             return;
         }
@@ -359,17 +499,40 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
                 return;
             }
         }
+        var submission = durableLog.submitAppend(additions);
+        if (!submission.accepted()) {
+            if (submission.status() == GroupCommitLog.SubmissionStatus.OVERLOADED) {
+                result.completeExceptionally(
+                        new QuorumUnavailableException("WAL admission queue is full"));
+            } else {
+                submission.durability().whenComplete((ignored, error) -> execute(() -> {
+                    var failure = error == null
+                            ? new IllegalStateException("WAL is unavailable")
+                            : unwrap(error);
+                    storageFailed(failure);
+                    result.completeExceptionally(failure);
+                }));
+            }
+            return;
+        }
+        beginFollowerMutation();
         log.addAll(additions);
         refreshStatus();
-        durableLog.append(additions).whenComplete((ignored, error) -> execute(() -> {
+        submission.durability().whenComplete((ignored, error) -> execute(() -> {
             if (error != null) {
                 storageFailed(error);
                 result.completeExceptionally(unwrap(error));
                 return;
             }
             durableIndex = Math.max(durableIndex, additions.get(additions.size() - 1).index());
-            advanceFollowerCommit(request.leaderCommit());
+            finishFollowerMutation();
+            if (!isCurrentLeaderRequest(request)) {
+                result.complete(new RaftRpc.AppendEntriesResponse(
+                        currentTerm, false, durableIndex, durableIndex + 1));
+                return;
+            }
             long match = request.prevLogIndex() + request.entries().size();
+            advanceFollowerCommit(Math.min(request.leaderCommit(), match));
             result.complete(new RaftRpc.AppendEntriesResponse(currentTerm, true, match, match + 1));
         }));
     }
@@ -378,11 +541,16 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
         if (closed.get() || !healthy || role == RaftRole.LEADER) {
             return;
         }
+        if (followerMutationInFlight) {
+            return;
+        }
         role = RaftRole.CANDIDATE;
         leaderId = null;
         currentTerm++;
         votedFor = configuration.nodeId();
-        persistMetadata();
+        if (!persistMetadata()) {
+            return;
+        }
         resetElectionTimer();
         refreshStatus();
 
@@ -417,7 +585,9 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
         cancel(electionTimer);
         nextIndex.clear();
         matchIndex.clear();
+        lastContactNanos.clear();
         replicationInFlight.clear();
+        leadershipStartedNanos = System.nanoTime();
         for (int member : configuration.members().keySet()) {
             nextIndex.put(member, durableIndex + 1);
             matchIndex.put(member, 0L);
@@ -444,12 +614,14 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
             var error = new NotLeaderException(newLeaderId);
             proposals.values().forEach(proposal -> proposal.future().completeExceptionally(error));
             proposals.clear();
+            failReadsAwaitingCurrentTermCommit(error);
         }
         role = RaftRole.FOLLOWER;
         leaderId = newLeaderId;
         cancel(heartbeatTimer);
         heartbeatTimer = null;
         replicationInFlight.clear();
+        lastContactNanos.clear();
         if (newTerm) {
             persistMetadata();
         }
@@ -461,20 +633,23 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
         if (role != RaftRole.LEADER || !healthy) {
             return;
         }
+        if (!hasRecentQuorum()) {
+            LOGGER.warn("Node {} stepped down after losing contact with a quorum in term {}",
+                    configuration.nodeId(), currentTerm);
+            becomeFollower(currentTerm, null);
+            return;
+        }
         for (int peer : configuration.peers().keySet()) {
             replicateTo(peer);
         }
     }
 
     private void replicateTo(int peer) {
-        if (role != RaftRole.LEADER || replicationInFlight.contains(peer)) {
+        if (role != RaftRole.LEADER || replicationInFlight.containsKey(peer)) {
             return;
         }
         long next = Math.max(1, Math.min(nextIndex.getOrDefault(peer, durableIndex + 1), durableIndex + 1));
-        long lastToSend = Math.min(durableIndex, next + MAX_APPEND_BATCH - 1);
-        var entries = next <= lastToSend
-                ? List.copyOf(log.subList(toOffset(next), toOffset(lastToSend) + 1))
-                : List.<RaftLogEntry>of();
+        var entries = replicationBatch(next);
         long requestTerm = currentTerm;
         var request = new RaftRpc.AppendEntriesRequest(
                 requestTerm,
@@ -483,9 +658,12 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
                 termAt(next - 1),
                 entries,
                 commitIndex);
-        replicationInFlight.add(peer);
+        long replicationToken = ++replicationSequence;
+        replicationInFlight.put(peer, replicationToken);
         transport.appendEntries(peer, request).whenComplete((response, error) -> execute(() -> {
-            replicationInFlight.remove(peer);
+            if (!replicationInFlight.remove(peer, replicationToken)) {
+                return;
+            }
             if (role != RaftRole.LEADER || currentTerm != requestTerm) {
                 return;
             }
@@ -496,19 +674,67 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
                 becomeFollower(response.term(), null);
                 return;
             }
+            if (response.term() == currentTerm) {
+                lastContactNanos.put(peer, System.nanoTime());
+            }
             if (response.success()) {
-                matchIndex.put(peer, response.matchIndex());
-                nextIndex.put(peer, response.matchIndex() + 1);
+                long confirmed = Math.max(
+                        matchIndex.getOrDefault(peer, 0L),
+                        Math.min(response.matchIndex(), durableIndex));
+                matchIndex.put(peer, confirmed);
+                nextIndex.merge(peer, confirmed + 1, Math::max);
                 advanceCommitIndex();
-                if (response.matchIndex() < durableIndex) {
+                if (confirmed < durableIndex) {
                     replicateTo(peer);
                 }
             } else {
                 long fallback = Math.max(1, Math.min(next - 1, response.conflictIndex()));
                 nextIndex.put(peer, fallback);
-                replicateTo(peer);
+                executor.schedule(
+                        () -> replicateTo(peer),
+                        Math.min(25, configuration.heartbeatInterval().toMillis()),
+                        TimeUnit.MILLISECONDS);
             }
         }));
+    }
+
+    private boolean hasRecentQuorum() {
+        if (configuration.majority() == 1) {
+            return true;
+        }
+        long now = System.nanoTime();
+        long window = configuration.electionTimeoutMax().toNanos();
+        if (now - leadershipStartedNanos < window) {
+            return true;
+        }
+        int reachable = 1;
+        long cutoff = now - window;
+        for (int peer : configuration.peers().keySet()) {
+            if (lastContactNanos.getOrDefault(peer, 0L) >= cutoff) {
+                reachable++;
+            }
+        }
+        return reachable >= configuration.majority();
+    }
+
+    private List<RaftLogEntry> replicationBatch(long firstIndex) {
+        if (firstIndex > durableIndex) {
+            return List.of();
+        }
+        var batch = new ArrayList<RaftLogEntry>(MAX_APPEND_BATCH);
+        int encodedBytes = 0;
+        for (long index = firstIndex;
+             index <= durableIndex && batch.size() < MAX_APPEND_BATCH;
+             index++) {
+            var entry = entryAt(index);
+            int entryBytes = Long.BYTES * 2 + Integer.BYTES + entry.command().encode().length;
+            if (!batch.isEmpty() && encodedBytes + entryBytes > MAX_APPEND_BYTES) {
+                break;
+            }
+            batch.add(entry);
+            encodedBytes += entryBytes;
+        }
+        return List.copyOf(batch);
     }
 
     private void advanceCommitIndex() {
@@ -544,9 +770,14 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
             return;
         }
         commitIndex = newCommitIndex;
-        persistMetadata();
+        if (!persistMetadata()) {
+            return;
+        }
         applyCommitted();
         refreshStatus();
+        if (role == RaftRole.LEADER && termAt(commitIndex) == currentTerm) {
+            resumeReadsAwaitingCurrentTermCommit();
+        }
     }
 
     private void applyCommitted() {
@@ -561,7 +792,7 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
     }
 
     private void resetElectionTimer() {
-        if (closed.get() || role == RaftRole.LEADER) {
+        if (closed.get() || role == RaftRole.LEADER || followerMutationInFlight) {
             return;
         }
         cancel(electionTimer);
@@ -571,12 +802,32 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
         electionTimer = executor.schedule(this::beginElection, delay, TimeUnit.MILLISECONDS);
     }
 
-    private void persistMetadata() {
+    private void beginFollowerMutation() {
+        followerMutationInFlight = true;
+        cancel(electionTimer);
+        electionTimer = null;
+    }
+
+    private void finishFollowerMutation() {
+        followerMutationInFlight = false;
+        resetElectionTimer();
+    }
+
+    private boolean isCurrentLeaderRequest(RaftRpc.AppendEntriesRequest request) {
+        return healthy
+                && role == RaftRole.FOLLOWER
+                && currentTerm == request.term()
+                && Objects.equals(leaderId, request.leaderId());
+    }
+
+    private boolean persistMetadata() {
         try {
             metadataStore.save(new RaftMetadata(
                     currentTerm, votedFor == null ? null : Integer.toString(votedFor), commitIndex));
-        } catch (IOException error) {
+            return true;
+        } catch (IOException | RuntimeException error) {
             storageFailed(error);
+            return false;
         }
     }
 
@@ -592,6 +843,7 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
         cancel(heartbeatTimer);
         proposals.values().forEach(proposal -> proposal.future().completeExceptionally(cause));
         proposals.clear();
+        failReadsAwaitingCurrentTermCommit(cause);
         refreshStatus();
         LOGGER.error("Node {} stopped participating after a storage failure",
                 configuration.nodeId(), cause);
@@ -609,6 +861,23 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
         }
         durableIndex = Math.min(durableIndex, fromIndex - 1);
         refreshStatus();
+    }
+
+    private void resumeReadsAwaitingCurrentTermCommit() {
+        if (readsAwaitingCurrentTermCommit.isEmpty()) {
+            return;
+        }
+        var waiting = List.copyOf(readsAwaitingCurrentTermCommit);
+        readsAwaitingCurrentTermCommit.clear();
+        for (var read : waiting) {
+            attemptRead(read.key(), read.future(), read.deadlineNanos());
+        }
+    }
+
+    private void failReadsAwaitingCurrentTermCommit(Throwable error) {
+        readsAwaitingCurrentTermCommit.forEach(
+                read -> read.future().completeExceptionally(error));
+        readsAwaitingCurrentTermCommit.clear();
     }
 
     private RaftLogEntry entryAt(long index) {
@@ -661,20 +930,41 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
     private void refreshStatus() {
         status = new RaftStatus(
                 configuration.nodeId(), role, currentTerm, leaderId, commitIndex, lastApplied,
-                lastLogIndex(), configuration.members().size());
+                lastLogIndex(), configuration.members().size(), healthy);
     }
 
-    private void execute(Runnable action) {
+    private boolean execute(Runnable action) {
         if (closed.get()) {
-            return;
+            return false;
         }
-        executor.execute(() -> {
+        try {
+            executor.execute(() -> {
+                try {
+                    action.run();
+                } catch (RuntimeException error) {
+                    LOGGER.error("Raft state-machine action failed", error);
+                }
+            });
+            return true;
+        } catch (RejectedExecutionException shuttingDown) {
+            return false;
+        }
+    }
+
+    private void submit(Runnable action, CompletableFuture<?> failureTarget) {
+        pendingOperations.add(failureTarget);
+        failureTarget.whenComplete((ignored, error) -> pendingOperations.remove(failureTarget));
+        boolean accepted = execute(() -> {
             try {
                 action.run();
             } catch (RuntimeException error) {
+                failureTarget.completeExceptionally(error);
                 LOGGER.error("Raft state-machine action failed", error);
             }
         });
+        if (!accepted) {
+            failureTarget.completeExceptionally(new IllegalStateException("Raft node is closed"));
+        }
     }
 
     private static void cancel(ScheduledFuture<?> future) {
@@ -694,13 +984,24 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
         if (!closed.compareAndSet(false, true)) {
             return;
         }
+        var error = new IllegalStateException("Raft node closed");
+        pendingOperations.forEach(operation -> operation.completeExceptionally(error));
+        pendingOperations.clear();
         cancel(electionTimer);
         cancel(heartbeatTimer);
-        var error = new IllegalStateException("Raft node closed");
-        proposals.values().forEach(proposal -> proposal.future().completeExceptionally(error));
-        proposals.clear();
         transport.close();
         executor.shutdownNow();
+        try {
+            if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                LOGGER.warn("Raft executor for node {} did not stop within 5 seconds",
+                        configuration.nodeId());
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        }
+        proposals.values().forEach(proposal -> proposal.future().completeExceptionally(error));
+        proposals.clear();
+        readsAwaitingCurrentTermCommit.clear();
         try {
             durableLog.close();
         } catch (IOException closeError) {
@@ -709,5 +1010,9 @@ public final class RaftNode implements RaftRpcHandler, AutoCloseable {
     }
 
     private record PendingProposal(CompletableFuture<Long> future) {
+    }
+
+    private record PendingRead(
+            byte[] key, CompletableFuture<byte[]> future, long deadlineNanos) {
     }
 }

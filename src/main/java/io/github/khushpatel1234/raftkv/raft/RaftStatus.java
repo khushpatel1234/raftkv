@@ -8,5 +8,6 @@ public record RaftStatus(
         long commitIndex,
         long lastApplied,
         long lastLogIndex,
-        int clusterSize) {
+        int clusterSize,
+        boolean healthy) {
 }

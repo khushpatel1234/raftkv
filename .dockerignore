@@ -1,0 +1,13 @@
+.git
+.github
+.idea
+.vscode
+target
+data
+bench/results
+*.iml
+*.log
+*.pyc
+__pycache__
+.env
+.env.*

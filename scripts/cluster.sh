@@ -45,8 +45,15 @@ case "${1:-}" in
   up)
     "${compose[@]}" up --detach --build
     "${compose[@]}" ps
-    echo "Cluster is starting on RESP ports 6379, 6380, and 6381."
-    echo "Run scripts/smoke.sh to wait for an elected leader and verify SET/GET."
+    echo "Cluster is starting. Published RESP endpoints:"
+    smoke_ports=""
+    for service in raftkv-1 raftkv-2 raftkv-3; do
+      published=$("${compose[@]}" port "${service}" 6379)
+      echo "  ${service}: ${published}"
+      published_port=${published##*:}
+      smoke_ports+="${smoke_ports:+,}${published_port}"
+    done
+    echo "Run RAFTKV_PORTS=${smoke_ports} scripts/smoke.sh to wait for a leader and verify SET/GET."
     ;;
   start)
     "${compose[@]}" start

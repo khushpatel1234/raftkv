@@ -80,20 +80,37 @@ public final class GroupCommitLog implements AutoCloseable {
     }
 
     public CompletableFuture<Void> append(RaftLogEntry entry) {
-        return append(List.of(Objects.requireNonNull(entry, "entry")));
+        return submitAppend(entry).durability();
     }
 
     /** Appends a contiguous list; the returned future covers every entry. */
     public CompletableFuture<Void> append(List<RaftLogEntry> entries) {
+        return submitAppend(entries).durability();
+    }
+
+    /**
+     * Atomically attempts to reserve queue capacity for one entry.
+     *
+     * <p>Raft uses this admission result before publishing an entry in its in-memory log, so a
+     * normal overload cannot create an index gap or be mistaken for a disk failure.</p>
+     */
+    public Submission submitAppend(RaftLogEntry entry) {
+        return submitAppend(List.of(Objects.requireNonNull(entry, "entry")));
+    }
+
+    /** Atomically attempts to reserve queue capacity for a contiguous entry list. */
+    public Submission submitAppend(List<RaftLogEntry> entries) {
         Objects.requireNonNull(entries, "entries");
         if (entries.isEmpty()) {
-            return CompletableFuture.completedFuture(null);
+            return new Submission(
+                    SubmissionStatus.ACCEPTED, CompletableFuture.completedFuture(null));
         }
         List<RaftLogEntry> copied;
         try {
             copied = List.copyOf(entries);
         } catch (NullPointerException exception) {
-            return CompletableFuture.failedFuture(exception);
+            return new Submission(
+                    SubmissionStatus.UNAVAILABLE, CompletableFuture.failedFuture(exception));
         }
         AppendRequest request = new AppendRequest(copied);
         return submit(request);
@@ -101,6 +118,11 @@ public final class GroupCommitLog implements AutoCloseable {
 
     /** Serializes a durable suffix truncation after all earlier append requests. */
     public CompletableFuture<Void> truncateSuffix(long fromIndexInclusive) {
+        return submitTruncateSuffix(fromIndexInclusive).durability();
+    }
+
+    /** Atomically attempts to reserve queue capacity for a durable suffix truncation. */
+    public Submission submitTruncateSuffix(long fromIndexInclusive) {
         TruncateRequest request = new TruncateRequest(fromIndexInclusive);
         return submit(request);
     }
@@ -150,6 +172,9 @@ public final class GroupCommitLog implements AutoCloseable {
         CloseRequest closeRequest = null;
         synchronized (submissionLock) {
             if (closeFuture == null) {
+                if (terminalFailure != null) {
+                    throw asIOException("Group commit writer has failed", terminalFailure);
+                }
                 accepting = false;
                 closeFuture = new CompletableFuture<>();
                 closeRequest = new CloseRequest(closeFuture);
@@ -161,7 +186,11 @@ public final class GroupCommitLog implements AutoCloseable {
                 queue.put(closeRequest);
             } catch (InterruptedException exception) {
                 Thread.currentThread().interrupt();
-                throw new IOException("Interrupted while closing group commit log", exception);
+                var failure = new IOException(
+                        "Interrupted while closing group commit log", exception);
+                closeRequest.fail(failure);
+                writerThread.interrupt();
+                throw failure;
             }
         }
         try {
@@ -175,7 +204,7 @@ public final class GroupCommitLog implements AutoCloseable {
         }
     }
 
-    private CompletableFuture<Void> submit(Request request) {
+    private Submission submit(Request request) {
         synchronized (submissionLock) {
             if (!accepting) {
                 Throwable failure = terminalFailure;
@@ -183,12 +212,31 @@ public final class GroupCommitLog implements AutoCloseable {
                     failure = new IllegalStateException("Group commit log is closed");
                 }
                 request.fail(failure);
-                return request.future();
+                return new Submission(SubmissionStatus.UNAVAILABLE, request.future());
             }
             if (!queue.offer(request)) {
                 request.fail(new RejectedExecutionException("Group commit queue is full"));
+                return new Submission(SubmissionStatus.OVERLOADED, request.future());
             }
-            return request.future();
+            return new Submission(SubmissionStatus.ACCEPTED, request.future());
+        }
+    }
+
+    public enum SubmissionStatus {
+        ACCEPTED,
+        OVERLOADED,
+        UNAVAILABLE
+    }
+
+    public record Submission(
+            SubmissionStatus status, CompletableFuture<Void> durability) {
+        public Submission {
+            Objects.requireNonNull(status, "status");
+            Objects.requireNonNull(durability, "durability");
+        }
+
+        public boolean accepted() {
+            return status == SubmissionStatus.ACCEPTED;
         }
     }
 
@@ -338,6 +386,9 @@ public final class GroupCommitLog implements AutoCloseable {
         terminalFailure = failure;
         synchronized (submissionLock) {
             accepting = false;
+            if (closeFuture != null) {
+                closeFuture.completeExceptionally(failure);
+            }
         }
         if (deferred != null) {
             deferred.fail(failure);
@@ -351,6 +402,12 @@ public final class GroupCommitLog implements AutoCloseable {
         } catch (IOException closeFailure) {
             failure.addSuppressed(closeFailure);
         }
+    }
+
+    private static IOException asIOException(String message, Throwable failure) {
+        return failure instanceof IOException ioException
+                ? ioException
+                : new IOException(message, failure);
     }
 
     private static void validateSequence(List<RaftLogEntry> entries, long expectedIndex) {

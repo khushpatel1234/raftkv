@@ -3,6 +3,10 @@ target/
 .vscode/
 *.iml
 *.log
+*.pyc
+__pycache__/
+.env
+.env.*
 .DS_Store
 data/
 bench/results/local-*.csv

@@ -179,7 +179,7 @@ public final class RaftMetadataStore {
             } catch (AtomicMoveNotSupportedException exception) {
                 throw new IOException("Atomic metadata replacement is not supported", exception);
             }
-            forceDirectoryBestEffort(parent);
+            forceDirectory(parent);
         } finally {
             Files.deleteIfExists(temporary);
         }
@@ -207,11 +207,13 @@ public final class RaftMetadataStore {
         }
     }
 
-    private static void forceDirectoryBestEffort(Path directory) {
+    private static void forceDirectory(Path directory) throws IOException {
         try (FileChannel channel = FileChannel.open(directory, StandardOpenOption.READ)) {
             channel.force(true);
-        } catch (IOException | UnsupportedOperationException ignored) {
-            // The atomically replaced file itself has already been forced.
+        } catch (UnsupportedOperationException unsupported) {
+            throw new IOException(
+                    "Directory fsync is required for durable Raft metadata: " + directory,
+                    unsupported);
         }
     }
 }

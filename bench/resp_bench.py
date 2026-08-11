@@ -147,7 +147,8 @@ def run_worker(
         if args.operation == "get":
             key = f"{args.key_prefix}:get:{rng.randrange(args.keyspace)}"
             return connection.execute("GET", key)  # type: ignore[union-attr]
-        key = f"{args.key_prefix}:set:{worker_id}:{sequence % args.keyspace}"
+        key_index = (sequence * args.clients + worker_id) % args.keyspace
+        key = f"{args.key_prefix}:set:{key_index}"
         sequence += 1
         return connection.execute("SET", key, value)  # type: ignore[union-attr]
 

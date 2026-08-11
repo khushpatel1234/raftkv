@@ -1,5 +1,6 @@
 # RaftKV
 
+[![CI](https://github.com/khushpatel1234/raftkv/actions/workflows/ci.yml/badge.svg)](https://github.com/khushpatel1234/raftkv/actions/workflows/ci.yml)
 [![Java 21](https://img.shields.io/badge/Java-21-ED8B00?logo=openjdk&logoColor=white)](https://openjdk.org/projects/jdk/21/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
@@ -43,8 +44,9 @@ flowchart LR
 Netty decodes RESP on a small event-loop group and hands typed commands to a
 bounded executor. Per-connection responses remain ordered even when command
 futures complete out of order. A single-threaded Raft core owns consensus state;
-disk work is batched separately, so socket and consensus threads are not blocked
-on `fsync`.
+high-frequency WAL forces run on a separate group-commit worker, while the Raft
+executor synchronously persists small term, vote, and commit-index records.
+Socket event loops never block on storage or consensus work.
 
 Successful mutations have been appended durably by a majority of the configured
 members and applied on the leader. A leader `GET` confirms contact with a
@@ -58,8 +60,8 @@ For protocol flow, storage details, and concurrency boundaries, see
 
 ## Quick start: three nodes
 
-Requirements: Docker with Compose v2. No local Java or Redis installation is
-needed for the cluster itself.
+Requirements: Docker with Compose v2, plus Python 3 for the smoke test. No local
+Java or Redis installation is needed for the cluster itself.
 
 ```bash
 ./scripts/cluster.sh up
@@ -75,6 +77,8 @@ The cluster has persistent named volumes. `./scripts/cluster.sh down` removes
 containers and the private network but deliberately preserves those volumes.
 Run `./scripts/cluster.sh help` for the lifecycle commands. Host ports and the
 image name can be changed with [the example environment file](config/cluster.env.example).
+When overriding ports, pass the published values to the smoke test, for example
+`RAFTKV_PORTS=7379,7380,7381 ./scripts/smoke.sh`.
 
 ## RESP examples
 
@@ -112,8 +116,10 @@ The supported command surface is intentionally small:
 
 Data commands sent to a follower return a RESP error with the known leader ID,
 if available. The server does not proxy or redirect the connection; clients must
-select the leader and retry. Because an error or lost connection can race with a
-commit, only retry idempotent operations automatically.
+select the leader and retry. Temporary quorum loss may return `NOTLEADER` or
+`TRYAGAIN`; WAL admission saturation returns `TRYAGAIN`. Because an error or
+lost connection can race with a commit, only retry idempotent operations
+automatically.
 
 ## Build and run without Docker
 
@@ -126,17 +132,23 @@ java -jar target/raftkv.jar --help
 
 Use a distinct client port, Raft port, and data directory for every process on
 one machine. Every node receives the same full membership string, including
-itself:
+itself. Run each self-contained command in a separate terminal:
 
 ```bash
-MEMBERS="1=127.0.0.1:7001,2=127.0.0.1:7002,3=127.0.0.1:7003"
+java -jar target/raftkv.jar --node-id=1 --client-host=127.0.0.1 \
+  --client-port=6379 --raft-host=127.0.0.1 --raft-port=7001 \
+  --data-dir=data/node-1 \
+  --peers="1=127.0.0.1:7001,2=127.0.0.1:7002,3=127.0.0.1:7003"
 
-java -jar target/raftkv.jar --node-id=1 --client-port=6379 --raft-port=7001 \
-  --data-dir=data/node-1 --peers="${MEMBERS}"
-java -jar target/raftkv.jar --node-id=2 --client-port=6380 --raft-port=7002 \
-  --data-dir=data/node-2 --peers="${MEMBERS}"
-java -jar target/raftkv.jar --node-id=3 --client-port=6381 --raft-port=7003 \
-  --data-dir=data/node-3 --peers="${MEMBERS}"
+java -jar target/raftkv.jar --node-id=2 --client-host=127.0.0.1 \
+  --client-port=6380 --raft-host=127.0.0.1 --raft-port=7002 \
+  --data-dir=data/node-2 \
+  --peers="1=127.0.0.1:7001,2=127.0.0.1:7002,3=127.0.0.1:7003"
+
+java -jar target/raftkv.jar --node-id=3 --client-host=127.0.0.1 \
+  --client-port=6381 --raft-host=127.0.0.1 --raft-port=7003 \
+  --data-dir=data/node-3 \
+  --peers="1=127.0.0.1:7001,2=127.0.0.1:7002,3=127.0.0.1:7003"
 ```
 
 The commands above run in the foreground; use separate terminals. Node IDs are
@@ -181,7 +193,8 @@ throughput by **8.4×** and reduced p99 latency by **85.8%** relative to the
 unbatched baseline. The exact workload and environment were not recorded, so
 the comparison should not be generalized beyond that run.
 
-To produce a fully attributed CSV on your machine:
+To produce a CSV with explicit workload controls and commit identity on your
+machine:
 
 ```bash
 ./scripts/smoke.sh                         # note the leader port

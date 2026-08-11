@@ -24,6 +24,9 @@ fi
 mkdir -p -- "$(dirname -- "${output}")"
 if command -v git >/dev/null 2>&1; then
   git_commit=$(git -C "${PROJECT_DIR}" rev-parse --short HEAD 2>/dev/null || true)
+  if [[ -n $(git -C "${PROJECT_DIR}" status --porcelain 2>/dev/null) ]]; then
+    git_commit="${git_commit:+${git_commit}-}dirty"
+  fi
 else
   git_commit=""
 fi
