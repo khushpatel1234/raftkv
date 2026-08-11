@@ -1,0 +1,62 @@
+name: raftkv
+
+x-raftkv-common: &raftkv-common
+  image: ${RAFTKV_IMAGE:-raftkv:local}
+  build:
+    context: .
+  init: true
+  restart: unless-stopped
+  stop_grace_period: 10s
+  networks:
+    - raftkv
+
+services:
+  raftkv-1:
+    <<: *raftkv-common
+    hostname: raftkv-1
+    command:
+      - --node-id=1
+      - --client-port=6379
+      - --raft-port=7000
+      - --data-dir=/data
+      - --peers=1=raftkv-1:7000,2=raftkv-2:7000,3=raftkv-3:7000
+    ports:
+      - "${RAFTKV_NODE1_CLIENT_PORT:-6379}:6379"
+    volumes:
+      - raftkv-1-data:/data
+
+  raftkv-2:
+    <<: *raftkv-common
+    hostname: raftkv-2
+    command:
+      - --node-id=2
+      - --client-port=6379
+      - --raft-port=7000
+      - --data-dir=/data
+      - --peers=1=raftkv-1:7000,2=raftkv-2:7000,3=raftkv-3:7000
+    ports:
+      - "${RAFTKV_NODE2_CLIENT_PORT:-6380}:6379"
+    volumes:
+      - raftkv-2-data:/data
+
+  raftkv-3:
+    <<: *raftkv-common
+    hostname: raftkv-3
+    command:
+      - --node-id=3
+      - --client-port=6379
+      - --raft-port=7000
+      - --data-dir=/data
+      - --peers=1=raftkv-1:7000,2=raftkv-2:7000,3=raftkv-3:7000
+    ports:
+      - "${RAFTKV_NODE3_CLIENT_PORT:-6381}:6379"
+    volumes:
+      - raftkv-3-data:/data
+
+networks:
+  raftkv:
+
+volumes:
+  raftkv-1-data:
+  raftkv-2-data:
+  raftkv-3-data:
