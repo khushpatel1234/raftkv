@@ -10,9 +10,6 @@ small database: non-blocking network I/O, bounded concurrency, explicit
 backpressure, leader election, linearizable reads, quorum durability, crash
 recovery, and group commit.
 
-> This is an educational systems project, not a drop-in Redis replacement or a
-> production database. See [Limitations](#limitations) before using it outside
-> a local or experimental environment.
 
 ## Highlights
 
